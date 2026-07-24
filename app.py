@@ -1,172 +1,284 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import requests
 import folium
 from streamlit_folium import st_folium
 from math import radians, cos, sin, asin, sqrt
 
-# --- Page Config & Styling ---
+# --- Page Setup & Theme Branding ---
 st.set_page_config(
-    page_title="Voltran & South India EV Analytics",
+    page_title="South India EV Charging Network Dashboard",
     page_icon="⚡",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
+# Custom Styling (Dark Navy #0B0F19, Voltran Electric Green #10B981, Glassmorphic Cards)
 st.markdown("""
     <style>
-    .main { background-color: #0B0F19; color: #F8FAFC; }
-    .stMetric { background-color: #1E293B; border: 1px solid #334155; border-radius: 10px; padding: 12px; }
-    .stMetric label { color: #94A3B8 !important; }
-    .stMetric div[data-testid="stMetricValue"] { color: #10B981 !important; font-weight: 700; }
+    .main {
+        background-color: #0B0F19;
+        color: #F8FAFC;
+    }
+    .stMetric {
+        background-color: #1E293B;
+        border: 1px solid #334155;
+        border-radius: 10px;
+        padding: 15px;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+    }
+    .stMetric label {
+        color: #94A3B8 !important;
+        font-weight: 600;
+    }
+    .stMetric div[data-testid="stMetricValue"] {
+        color: #10B981 !important;
+        font-weight: 700;
+    }
     </style>
 """, unsafe_allow_html=True)
 
-# --- Haversine Distance Formula ---
+# --- Distance Calculation (Haversine Formula) ---
 def haversine(lat1, lon1, lat2, lon2):
-    r = 6371.0
+    r = 6371.0 # Radius of earth in kilometers
     lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
-    dlat, dlon = lat2 - lat1, lon2 - lon1
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
     a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
     return 2 * r * asin(sqrt(a))
 
-# --- Verified Official Voltran Network Dataset ---
+# --- Verified Official Voltran Network Directory ---
 @st.cache_data
-def load_official_voltran_data():
+def load_verified_voltran_data():
     return pd.DataFrame([
-        {"name": "Voltran - Madhapur Charge Hub", "provider": "Voltran", "state": "Telangana", "lat": 17.44610, "lon": 78.39830, "address": "Road No. 9, Kakatiya Hills, Madhapur, Hyderabad", "kw": "60kW DC (6 Guns)", "status": "Operational"},
-        {"name": "Voltran - Suryapet Hub (NH65)", "provider": "Voltran", "state": "Telangana", "lat": 17.14380, "lon": 79.62380, "address": "Opp 7 Food Court, NH65, Rayangudem, Suryapet", "kw": "60kW DC", "status": "Operational"},
-        {"name": "Voltran - Shamshabad Hub", "provider": "Voltran", "state": "Telangana", "status": "Operational", "lat": 17.25430, "lon": 78.43120, "address": "NH44 / ORR Junction, Shamshabad, Hyderabad", "kw": "60kW DC"},
-        {"name": "Voltran - Nizamabad Hub", "provider": "Voltran", "state": "Telangana", "status": "Operational", "lat": 18.67250, "lon": 78.09410, "address": "Nizamabad Bypass, Telangana", "kw": "60kW DC"},
-        {"name": "Voltran - Beechupalli Hub", "provider": "Voltran", "state": "Telangana", "status": "Operational", "lat": 16.14230, "lon": 77.92560, "address": "Adj Udupi Sri Vihar, NH44, Beechupalli", "kw": "60kW DC"},
-        {"name": "Voltran - Miryalaguda Hub", "provider": "Voltran", "state": "Telangana", "status": "Operational", "lat": 16.87600, "lon": 79.56300, "address": "Miryalaguda Bypass Rd, Telangana", "kw": "60kW DC"},
-        {"name": "Voltran - Nallagandla Hub", "provider": "Voltran", "state": "Telangana", "status": "Operational", "lat": 17.48510, "lon": 78.30900, "address": "Nallagandla, Hyderabad, Telangana", "kw": "60kW DC"},
-        {"name": "Voltran - Tirupati Charge Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 13.62880, "lon": 79.41920, "address": "Tirumala Bypass Rd, Srinivasa Nagar, Tirupati", "kw": "60kW DC"},
-        {"name": "Voltran - Srikakulam Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 18.29690, "lon": 83.89680, "address": "Survey 75/25A, NH16 Service Rd, Kushalapuram", "kw": "60kW DC"},
-        {"name": "Voltran - Rajahmundry Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 17.00050, "lon": 81.78000, "address": "Samalkota Rd Junction, Rajanagaram", "kw": "60kW DC"},
-        {"name": "Voltran - Ongole Charge Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 15.50570, "lon": 80.04990, "address": "Mukthinutala Padu Rural, Ongole", "kw": "60kW DC"},
-        {"name": "Voltran - Nellore Charge Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 14.44260, "lon": 79.98650, "address": "Chowtapalem, Kanupur Bit-II, Nellore", "kw": "60kW DC"},
-        {"name": "Voltran - Mydukur Charge Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 14.78330, "lon": 78.60000, "address": "Mydukur Bypass Rd, Bhumayapalle", "kw": "60kW DC"},
-        {"name": "Voltran - Kakinada Charge Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 16.98910, "lon": 82.24750, "address": "Achampeta Junction, Thimmapuram, Kakinada", "kw": "60kW DC"},
-        {"name": "Voltran - Gannavaram Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 16.53880, "lon": 80.79610, "address": "NH5, Kesarapalle, Vijayawada Airport Zone", "kw": "60kW DC"},
-        {"name": "Voltran - Gollapudi Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 16.54120, "lon": 80.57800, "address": "Bus Stop, NH65, Nallakunta, Vijayawada", "kw": "60kW DC"},
-        {"name": "Voltran - Amaravati Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 16.35200, "lon": 80.52830, "address": "Kaza, Guntur Highway, Amaravati", "kw": "60kW DC"},
-        {"name": "Voltran - Anantapur Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 14.68190, "lon": 77.60060, "address": "Rudrampeta NH44 Bypass, Anantapur", "kw": "60kW DC"},
-        {"name": "Voltran - Machilipatnam Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 16.18120, "lon": 81.13200, "address": "Machilipatnam Town, Andhra Pradesh", "kw": "60kW DC"}
+        # Telangana Official Voltran Hubs
+        {"name": "Voltran - Madhapur Charge Hub", "provider": "Voltran", "state": "Telangana", "status": "Operational", "lat": 17.44610, "lon": 78.39830, "corridor": "Hyderabad Urban", "kw": "60kW DC (6 Guns)", "amenities": "⚡ 24/7 | ☕ Cafe | 📶 Wi-Fi"},
+        {"name": "Voltran - Suryapet Hub (NH65)", "provider": "Voltran", "state": "Telangana", "status": "Operational", "lat": 17.14380, "lon": 79.62380, "corridor": "NH65 (Hyd-Vja)", "kw": "60kW DC", "amenities": "⚡ 24/7 | 🍔 Food | 🚻 Restroom"},
+        {"name": "Voltran - Suryapet 2 Hub", "provider": "Voltran", "state": "Telangana", "status": "Operational", "lat": 17.15100, "lon": 79.63500, "corridor": "NH65 (Hyd-Vja)", "kw": "60kW DC", "amenities": "⚡ 24/7 | 🍔 Food Court | 🚻 Restroom"},
+        {"name": "Voltran - Shamshabad Hub", "provider": "Voltran", "state": "Telangana", "status": "Operational", "lat": 17.25430, "lon": 78.43120, "corridor": "NH44 / ORR", "kw": "60kW DC", "amenities": "⚡ 24/7 | 📶 Wi-Fi | 🚻 Restroom"},
+        {"name": "Voltran - Nizamabad Hub", "provider": "Voltran", "state": "Telangana", "status": "Operational", "lat": 18.67250, "lon": 78.09410, "corridor": "NH44 North", "kw": "60kW DC", "amenities": "⚡ 24/7 | 🅿️ Parking | 🚻 Restroom"},
+        {"name": "Voltran - Beechupalli Hub", "provider": "Voltran", "state": "Telangana", "status": "Operational", "lat": 16.14230, "lon": 77.92560, "corridor": "NH44 South", "kw": "60kW DC", "amenities": "⚡ 24/7 | 🍔 Food | 🚻 Restroom"},
+        {"name": "Voltran - Miryalaguda Hub", "provider": "Voltran", "state": "Telangana", "status": "Operational", "lat": 16.87600, "lon": 79.56300, "corridor": "Miryalaguda Bypass", "kw": "60kW DC", "amenities": "⚡ 24/7 | 🍔 Food | 🚻 Restroom"},
+        {"name": "Voltran - Nallagandla Hub", "provider": "Voltran", "state": "Telangana", "status": "Operational", "lat": 17.48510, "lon": 78.30900, "corridor": "Hyderabad West", "kw": "60kW DC", "amenities": "⚡ 24/7 | 🅿️ Parking"},
+        {"name": "Voltran - Aushapur Hub", "provider": "Voltran", "state": "Telangana", "status": "Coming Soon", "lat": 17.34810, "lon": 78.25190, "corridor": "Warangal Highway", "kw": "60kW DC", "amenities": "⚡ 24/7 | 🍔 Food"},
+
+        # Andhra Pradesh Official Voltran Hubs
+        {"name": "Voltran - Tirupati Charge Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 13.62880, "lon": 79.41920, "corridor": "NH71 / Rayalaseema", "kw": "60kW DC", "amenities": "⚡ 24/7 | 📶 Wi-Fi | 🚻 Restroom"},
+        {"name": "Voltran - Srikakulam Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 18.29690, "lon": 83.89680, "corridor": "NH16 North Coast", "kw": "60kW DC", "amenities": "⚡ 24/7 | 🍔 Food | 🚻 Restroom"},
+        {"name": "Voltran - Rajahmundry Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 17.00050, "lon": 81.78000, "corridor": "NH16 Mid Coast", "kw": "60kW DC", "amenities": "⚡ 24/7 | 🅿️ Parking | 🍔 Food"},
+        {"name": "Voltran - Ongole Charge Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 15.50570, "lon": 80.04990, "corridor": "NH16 South Coast", "kw": "60kW DC", "amenities": "⚡ 24/7 | 📶 Wi-Fi | 🚻 Restroom"},
+        {"name": "Voltran - Nellore Charge Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 14.44260, "lon": 79.98650, "corridor": "NH16 South Coast", "kw": "60kW DC", "amenities": "⚡ 24/7 | 📶 Wi-Fi | 🍔 Food"},
+        {"name": "Voltran - Mydukur Charge Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 14.78330, "lon": 78.60000, "corridor": "NH40 (Kurnool-Kadapa)", "kw": "60kW DC", "amenities": "⚡ 24/7 | 🍽️ Restaurant | 🚻 Restroom"},
+        {"name": "Voltran - Kakinada Charge Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 16.98910, "lon": 82.24750, "corridor": "Kakinada Port Belt", "kw": "60kW DC", "amenities": "⚡ 24/7 | 📶 Wi-Fi | 🍔 Food"},
+        {"name": "Voltran - Gannavaram Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 16.53880, "lon": 80.79610, "corridor": "NH16 Vijayawada Airport", "kw": "60kW DC", "amenities": "⚡ 24/7 | 📶 Wi-Fi | 🚻 Restroom"},
+        {"name": "Voltran - Gollapudi Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 16.54120, "lon": 80.57800, "corridor": "NH65 Vijayawada", "kw": "60kW DC", "amenities": "⚡ 24/7 | 📶 Wi-Fi"},
+        {"name": "Voltran - Amaravati Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 16.35200, "lon": 80.52830, "corridor": "Capital Region / NH65", "kw": "60kW DC", "amenities": "⚡ 24/7 | 📶 Wi-Fi | 🚻 Restroom"},
+        {"name": "Voltran - Anantapur Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 14.68190, "lon": 77.60060, "corridor": "NH44 South", "kw": "60kW DC", "amenities": "⚡ 24/7 | 📶 Wi-Fi | 🍔 Food"},
+        {"name": "Voltran - Machilipatnam Hub", "provider": "Voltran", "state": "Andhra Pradesh", "status": "Operational", "lat": 16.18120, "lon": 81.13200, "corridor": "Machilipatnam Highway", "kw": "60kW DC", "amenities": "⚡ 24/7 | 📶 Wi-Fi"}
     ])
 
-# --- Fetch Live Multi-CPO Data from Open Charge Map API ---
+# --- Fetch Live Geotagged Stations for Other CPOs (Open Charge Map API) ---
 @st.cache_data(ttl=3600)
-def fetch_openchargemap_stations(lat=15.5, lon=78.5, distance_km=400, max_results=100):
+def fetch_live_partner_stations():
+    # Regional centers for South/West India: Bengaluru, Chennai, Mumbai/Pune, Hyderabad
+    centers = [
+        {"lat": 12.9716, "lon": 77.5946, "state": "Karnataka"},
+        {"lat": 13.0827, "lon": 80.2707, "state": "Tamil Nadu"},
+        {"lat": 18.5204, "lon": 73.8567, "state": "Maharashtra"},
+        {"lat": 17.3850, "lon": 78.4867, "state": "Telangana"}
+    ]
+    
     url = "https://api.openchargemap.io/v3/poi/"
-    params = {
-        "output": "json",
-        "countrycode": "IN",
-        "latitude": lat,
-        "longitude": lon,
-        "distance": distance_km,
-        "distanceunit": "KM",
-        "maxresults": max_results,
-        "compact": "true",
-        "verbose": "false",
-        "key": "8647c0b0-27bb-4e2a-a2db-6447cbe60144" # Standard public developer key
-    }
-    headers = {"User-Agent": "VoltranEVApp/1.0"}
-    try:
-        res = requests.get(url, params=params, headers=headers, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            ocm_list = []
-            for item in data:
-                addr = item.get("AddressInfo", {})
-                operator = item.get("OperatorInfo", {}).get("Title", "Other CPO")
-                
-                # Standardize provider names
-                provider = "Other CPO"
-                if "Tata" in operator or "Tata" in addr.get("Title", ""): provider = "Tata Power"
-                elif "Zeon" in operator or "Zeon" in addr.get("Title", ""): provider = "Zeon Charging"
-                elif "ChargeZone" in operator: provider = "ChargeZone"
-                elif "Jio" in operator or "bp" in operator: provider = "Jio-bp pulse"
-                elif "Statiq" in operator: provider = "Statiq"
-                elif "Ather" in operator: provider = "Ather Grid"
-                
-                ocm_list.append({
-                    "name": addr.get("Title", "EV Station"),
-                    "provider": provider,
-                    "state": addr.get("StateOrProvince", "South India"),
-                    "lat": addr.get("Latitude"),
-                    "lon": addr.get("Longitude"),
-                    "address": addr.get("AddressLine1", "Highway / Urban Station"),
-                    "kw": "DC Fast Charger",
-                    "status": "Operational"
-                })
-            return pd.DataFrame(ocm_list)
-    except Exception:
-        pass
+    all_stations = []
+    
+    headers = {"User-Agent": "VoltranEVAnalytics/1.0"}
+    
+    for c in centers:
+        params = {
+            "output": "json",
+            "countrycode": "IN",
+            "latitude": c["lat"],
+            "longitude": c["lon"],
+            "distance": 350,
+            "distanceunit": "KM",
+            "maxresults": 60,
+            "compact": "true",
+            "key": "8647c0b0-27bb-4e2a-a2db-6447cbe60144"
+        }
+        try:
+            res = requests.get(url, params=params, headers=headers, timeout=4)
+            if res.status_code == 200:
+                for item in res.json():
+                    addr = item.get("AddressInfo", {})
+                    operator = item.get("OperatorInfo", {}).get("Title", "")
+                    
+                    provider = "Other CPO"
+                    if "Tata" in operator or "Tata" in addr.get("Title", ""): provider = "Tata Power"
+                    elif "Zeon" in operator or "Zeon" in addr.get("Title", ""): provider = "Zeon Charging"
+                    elif "ChargeZone" in operator: provider = "ChargeZone"
+                    elif "Jio" in operator or "bp" in operator: provider = "Jio-bp pulse"
+                    elif "Statiq" in operator: provider = "Statiq"
+                    elif "Ather" in operator: provider = "Ather Grid"
+                    elif "Fortum" in operator or "GLIDA" in operator: provider = "GLIDA"
+                    
+                    if provider != "Other CPO" and addr.get("Latitude") and addr.get("Longitude"):
+                        all_stations.append({
+                            "name": f"{provider} - {addr.get('Title', 'Charge Point')}",
+                            "provider": provider,
+                            "state": addr.get("StateOrProvince") if addr.get("StateOrProvince") in ["Karnataka", "Maharashtra", "Tamil Nadu", "Andhra Pradesh", "Telangana"] else c["state"],
+                            "status": "Operational",
+                            "lat": addr.get("Latitude"),
+                            "lon": addr.get("Longitude"),
+                            "corridor": addr.get("AddressLine1", "Highway Transit Axis"),
+                            "kw": "DC Fast Charger",
+                            "amenities": "⚡ Fast Charging | 24/7 Access"
+                        })
+        except Exception:
+            continue
+            
+    if all_stations:
+        return pd.DataFrame(all_stations).drop_duplicates(subset=['lat', 'lon'])
     return pd.DataFrame()
 
-# --- Sidebar ---
-st.sidebar.title("🎛️ Network Controls")
-use_live_ocm = st.sidebar.checkbox("📡 Pull Live Partner Stations (Open Charge Map)", value=True)
+# --- Load & Combine Datasets ---
+voltran_df = load_verified_voltran_data()
+partner_df = fetch_live_partner_stations()
 
-# Load Data
-voltran_df = load_official_voltran_data()
-if use_live_ocm:
-    ocm_df = fetch_openchargemap_stations()
-    full_df = pd.concat([voltran_df, ocm_df], ignore_index=True) if not ocm_df.empty else voltran_df
+if not partner_df.empty:
+    df = pd.concat([voltran_df, partner_df], ignore_index=True)
 else:
-    full_df = voltran_df
+    df = voltran_df
 
-# Filters
-available_providers = list(full_df['provider'].unique())
-selected_providers = st.sidebar.multiselect("Select Networks:", available_providers, default=available_providers)
-
-filtered_df = full_df[full_df['provider'].isin(selected_providers)]
-
-# --- UI Header ---
-st.title("⚡ Official Voltran & South India EV Grid")
-st.markdown("Verified Voltran hubs paired with real-time Open Charge Map geolocation feeds.")
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Verified Voltran Active Hubs", len(voltran_df))
-col2.metric("Total Map Stations", len(filtered_df))
-col3.metric("Data Source Status", "Live API Feed Active" if use_live_ocm else "Voltran Direct Data")
-
-# --- Map Rendering ---
-m = folium.Map(location=[16.0, 79.0], zoom_start=7, tiles="CartoDB dark_matter")
-
+# --- Provider Color Palette ---
 PROVIDER_COLORS = {
     "Voltran": "green",
     "Tata Power": "blue",
     "Zeon Charging": "cadetblue",
     "ChargeZone": "purple",
-    "Jio-bp pulse": "red",
     "Statiq": "darkgreen",
-    "Ather Grid": "orange",
+    "Jio-bp pulse": "red",
+    "GLIDA": "orange",
+    "Ather Grid": "darkred",
     "Other CPO": "gray"
 }
 
+# --- Sidebar Controls ---
+st.sidebar.image("https://www.voltran.in/assets/img/logo.png", width=180)
+st.sidebar.markdown("---")
+st.sidebar.title("🎛️ Regional Filters")
+
+# State Multi-Select
+available_states = ["Andhra Pradesh", "Telangana", "Karnataka", "Maharashtra", "Tamil Nadu"]
+selected_states = st.sidebar.multiselect("Select States:", options=available_states, default=available_states)
+
+# Provider Multi-Select
+available_providers = list(df['provider'].unique())
+selected_providers = st.sidebar.multiselect("Select EV Networks:", options=available_providers, default=available_providers)
+
+# Map Style Selector
+map_theme = st.sidebar.selectbox(
+    "Map Visual Style:",
+    options=["Dark Canvas (CartoDB Dark)", "Light / Clean (CartoDB Voyager)", "OpenStreetMap"],
+    index=0
+)
+
+show_gaps = st.sidebar.checkbox("Highlight Highway Network Gaps (>100 km)", value=True)
+
+# Apply Filters
+filtered_df = df[(df['state'].isin(selected_states)) & (df['provider'].isin(selected_providers))].reset_index(drop=True)
+
+# --- Header & High Level Metrics ---
+st.title("⚡ South India EV Infrastructure Dashboard")
+st.markdown("Coverage map tracking verified **Voltran** hubs alongside **Tata Power, Zeon, Statiq, ChargeZone, Jio-bp, GLIDA, and Ather** across 5 states.")
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Total Active Stations On Map", len(filtered_df))
+m2.metric("Voltran Active Hubs", len(filtered_df[filtered_df['provider'] == 'Voltran']))
+m3.metric("States Filtered", len(selected_states))
+m4.metric("Estimated Fast Guns", f"{len(filtered_df) * 3}+ Guns")
+
+# --- Interactive Map ---
+st.subheader("📍 Multi-State EV Charging Network Map")
+
+# Map Tile Selection
+tile_provider = "CartoDB dark_matter"
+if "Voyager" in map_theme:
+    tile_provider = "CartoDB voyager"
+elif "OpenStreetMap" in map_theme:
+    tile_provider = "OpenStreetMap"
+
+# Centering map on Southern Peninsula
+m = folium.Map(location=[15.2, 77.5], zoom_start=6, tiles=tile_provider)
+
+# Render Markers
 for _, row in filtered_df.iterrows():
-    if pd.isna(row['lat']) or pd.isna(row['lon']): continue
-    color = PROVIDER_COLORS.get(row['provider'], 'gray')
+    icon_color = PROVIDER_COLORS.get(row['provider'], 'gray')
     
-    popup_text = f"""
-    <div style='font-family: Arial; width: 220px;'>
-        <h4 style='color:#10B981; margin-bottom: 4px;'>{row['name']}</h4>
-        <b>Provider:</b> {row['provider']}<br>
-        <b>Address:</b> {row['address']}<br>
-        <b>Type:</b> {row['kw']}
+    popup_content = f"""
+    <div style='font-family: Arial, sans-serif; width: 220px;'>
+        <h4 style='margin-bottom: 5px; color: #10B981;'>{row['name']}</h4>
+        <b>Network:</b> {row['provider']}<br>
+        <b>State:</b> {row['state']}<br>
+        <b>Capacity:</b> {row['kw']}<br>
+        <b>Location/Corridor:</b> {row['corridor']}<br>
+        <hr style='margin: 8px 0;'>
+        <small>{row['amenities']}</small>
     </div>
     """
     
     folium.Marker(
         location=[row['lat'], row['lon']],
-        popup=folium.Popup(popup_text, max_width=250),
-        tooltip=f"{row['provider']}: {row['name']}",
-        icon=folium.Icon(color=color, icon="bolt", prefix="fa")
+        popup=folium.Popup(popup_content, max_width=260),
+        tooltip=f"{row['provider']}: {row['name']} ({row['state']})",
+        icon=folium.Icon(color=icon_color, icon="bolt", prefix="fa")
     ).add_to(m)
 
-st_folium(m, width=1300, height=520)
+# Highlight Gap Fill Recommendations
+if show_gaps and len(filtered_df) > 1:
+    op_df = filtered_df[filtered_df['status'] == 'Operational'].reset_index(drop=True)
+    for i in range(min(len(op_df), 40)):
+        for j in range(i + 1, min(len(op_df), 40)):
+            s1 = op_df.iloc[i]
+            s2 = op_df.iloc[j]
+            dist = haversine(s1['lat'], s1['lon'], s2['lat'], s2['lon'])
+            
+            # Show gaps on same corridor between 100km and 220km
+            if 100 <= dist <= 220 and s1['corridor'] == s2['corridor']:
+                mid_lat = (s1['lat'] + s2['lat']) / 2
+                mid_lon = (s1['lon'] + s2['lon']) / 2
+                
+                folium.Marker(
+                    location=[mid_lat, mid_lon],
+                    popup=f"<b>PROPOSED EXPANSION TARGET</b><br>Corridor: {s1['corridor']}<br>Gap: {round(dist,1)} km between {s1['name']} & {s2['name']}",
+                    tooltip="⭐ Recommended New Station Location",
+                    icon=folium.Icon(color="red", icon="star", prefix="fa")
+                ).add_to(m)
 
-# --- Directory Table ---
-with st.expander("📋 View Complete Geo-Verified Station Directory"):
-    st.dataframe(filtered_df[['name', 'provider', 'address', 'kw', 'lat', 'lon']], use_container_width=True)
+st_folium(m, width=1300, height=550)
+
+# --- Point-to-Point Highway Route & Distance Estimator ---
+st.markdown("---")
+st.subheader("🛣️ Inter-State Highway Distance & Charging Estimator")
+
+c1, c2, c3 = st.columns(3)
+
+station_list = filtered_df['name'].tolist()
+if len(station_list) >= 2:
+    start_station = c1.selectbox("Select Origin Hub:", station_list, index=0)
+    end_station = c2.selectbox("Select Destination Hub:", station_list, index=min(4, len(station_list)-1))
+
+    if start_station and end_station and start_station != end_station:
+        s_row = filtered_df[filtered_df['name'] == start_station].iloc[0]
+        e_row = filtered_df[filtered_df['name'] == end_station].iloc[0]
+        
+        dist_km = round(haversine(s_row['lat'], s_row['lon'], e_row['lat'], e_row['lon']), 1)
+        est_drive_min = int((dist_km / 65) * 60) # Avg highway speed 65 km/h
+        est_charge_stops = int(dist_km // 220) # Stopping every ~220 km
+        
+        c3.markdown(f"### 📏 **{dist_km} km**")
+        c3.caption(f"Estimated Drive Time: ~{est_drive_min // 60}h {est_drive_min % 60}m | Suggested Fast Charging Stops: {est_charge_stops}")
+
+# Directory View
+with st.expander("📊 Explore Complete Multi-State Charging Station Directory"):
+    st.dataframe(filtered_df[['name', 'provider', 'state', 'corridor', 'kw', 'amenities', 'status', 'lat', 'lon']], use_container_width=True)
