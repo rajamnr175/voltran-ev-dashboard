@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import folium
+import re
 from streamlit_folium import st_folium
 from math import radians, cos, sin, asin, sqrt
 
@@ -151,6 +152,38 @@ def load_data():
 
 df = load_data()
 
+# --- National Highway Tagging ---
+def extract_highway(corridor):
+    """Pulls a clean 'NH65' style tag out of a messy corridor string.
+    Returns None for corridors that aren't tagged to a numbered NH
+    (local/urban hubs, named expressways, state highways)."""
+    match = re.search(r'NH\s*-?\s*(\d+)', str(corridor), re.IGNORECASE)
+    return f"NH{match.group(1)}" if match else None
+
+df['highway'] = df['corridor'].apply(extract_highway)
+
+# --- Order stations along a highway using geographic distance from one end ---
+@st.cache_data
+def order_along_highway(hw_df):
+    hw_df = hw_df.reset_index(drop=True).copy()
+    if len(hw_df) < 2:
+        hw_df['position_km'] = 0.0
+        return hw_df
+    # Find the two most geographically distant stations -> treat as the
+    # two "ends" of the highway stretch covered by this dataset.
+    max_dist, anchor_idx = -1, 0
+    for i in range(len(hw_df)):
+        for j in range(i + 1, len(hw_df)):
+            d = haversine(hw_df.loc[i, 'lat'], hw_df.loc[i, 'lon'],
+                          hw_df.loc[j, 'lat'], hw_df.loc[j, 'lon'])
+            if d > max_dist:
+                max_dist, anchor_idx = d, i
+    anchor = hw_df.loc[anchor_idx]
+    hw_df['position_km'] = hw_df.apply(
+        lambda r: haversine(anchor['lat'], anchor['lon'], r['lat'], r['lon']), axis=1
+    )
+    return hw_df.sort_values('position_km').reset_index(drop=True)
+
 # --- Provider Color Palette ---
 PROVIDER_COLORS = {
     "Voltran": "green",
@@ -295,7 +328,11 @@ for _, row in filtered_df.iterrows():
 st_folium(m, width=1300, height=520)
 
 # --- Analysis Tabs ---
-tab1, tab2 = st.tabs(["📏 Distance to Next Charging Station", "📋 Full Searchable Directory"])
+tab1, tab2, tab3 = st.tabs([
+    "📏 Distance to Next Charging Station",
+    "📋 Full Searchable Directory",
+    "🛣️ Highway Corridor View"
+])
 
 with tab1:
     st.subheader("Inter-Station Proximity & Next Station Distance Analysis")
@@ -309,3 +346,105 @@ with tab1:
 with tab2:
     st.subheader("Searchable Station Directory by State & Network")
     st.dataframe(filtered_df[['name', 'provider', 'state', 'status', 'corridor', 'kw', 'address', 'lat', 'lon']], use_container_width=True)
+
+with tab3:
+    st.subheader("🛣️ Plan Your Route on a Single National Highway")
+    st.markdown(
+        "Pick a highway to see every charging station along it, in order. "
+        "Click a marker to see the next station in **both directions**, how far it is, "
+        "and everything you need for the leg ahead."
+    )
+
+    available_highways = sorted(df['highway'].dropna().unique())
+
+    if not available_highways:
+        st.info("No stations in the current dataset are tagged to a numbered national highway.")
+    else:
+        selected_highway = st.selectbox("Choose a National Highway:", options=available_highways)
+
+        hw_df = df[df['highway'] == selected_highway]
+        hw_df = order_along_highway(hw_df)
+        total_on_highway = len(hw_df)
+
+        st.markdown(
+            f"**{selected_highway}** has **{total_on_highway} charging station(s)** in this dataset, "
+            f"spanning roughly **{hw_df['position_km'].max():.0f} km** end to end."
+        )
+
+        # --- Highway Map: markers in travel order, connected by a route line ---
+        hw_center_lat = hw_df['lat'].mean()
+        hw_center_lon = hw_df['lon'].mean()
+        hm = folium.Map(location=[hw_center_lat, hw_center_lon], zoom_start=7, tiles="CartoDB dark_matter")
+
+        route_points = list(zip(hw_df['lat'], hw_df['lon']))
+        folium.PolyLine(route_points, color="#10B981", weight=3, opacity=0.6, dash_array="6").add_to(hm)
+
+        for idx, row in hw_df.iterrows():
+            is_upcoming = row['status'] == "Upcoming"
+            icon_type = folium.Icon(
+                color="orange" if is_upcoming else PROVIDER_COLORS.get(row['provider'], 'gray'),
+                icon="star" if is_upcoming else "bolt",
+                prefix="fa"
+            )
+            folium.Marker(
+                location=[row['lat'], row['lon']],
+                tooltip=row['name'],
+                popup=f"Stop {idx + 1} of {total_on_highway} on {selected_highway}",
+                icon=icon_type
+            ).add_to(hm)
+
+        hw_map_data = st_folium(hm, width=1300, height=520, key=f"highway_map_{selected_highway}")
+
+        # --- Detail panel for the clicked station ---
+        clicked_name = None
+        if hw_map_data and hw_map_data.get("last_object_clicked_tooltip"):
+            clicked_name = hw_map_data["last_object_clicked_tooltip"]
+
+        if clicked_name and clicked_name in hw_df['name'].values:
+            pos = hw_df.index[hw_df['name'] == clicked_name][0]
+            station = hw_df.loc[pos]
+
+            st.markdown("---")
+            st.markdown(f"### 📍 {station['name']}  &nbsp; <span style='font-size:14px; color:#94A3B8;'>(Stop {pos + 1} of {total_on_highway} on {selected_highway})</span>", unsafe_allow_html=True)
+
+            c1, c2, c3 = st.columns(3)
+
+            # Previous station (toward the anchor / one direction)
+            with c1:
+                st.markdown("**⬅️ Previous Station**")
+                if pos > 0:
+                    prev = hw_df.loc[pos - 1]
+                    dist = station['position_km'] - prev['position_km']
+                    st.markdown(f"**{prev['name']}**")
+                    st.markdown(f"📏 {dist:.1f} km away")
+                    st.markdown(f"⚡ {prev['kw']} · {prev['provider']}")
+                    st.markdown(f"🟢 {prev['status']}" if prev['status'] == "Operational" else f"⭐ {prev['status']}")
+                else:
+                    st.markdown("_This is the first station on this highway._")
+
+            # Current station details
+            with c2:
+                st.markdown("**🔌 This Station**")
+                st.markdown(f"**Provider:** {station['provider']}")
+                st.markdown(f"**Status:** {'🟢 Operational' if station['status'] == 'Operational' else '⭐ Upcoming'}")
+                st.markdown(f"**Charging Speed:** {station['kw']}")
+                st.markdown(f"**State:** {station['state']}")
+                st.markdown(f"**Address:** {station['address']}")
+
+            # Next station (the other direction)
+            with c3:
+                st.markdown("**➡️ Next Station**")
+                if pos < total_on_highway - 1:
+                    nxt = hw_df.loc[pos + 1]
+                    dist = nxt['position_km'] - station['position_km']
+                    st.markdown(f"**{nxt['name']}**")
+                    st.markdown(f"📏 {dist:.1f} km away")
+                    st.markdown(f"⚡ {nxt['kw']} · {nxt['provider']}")
+                    st.markdown(f"🟢 {nxt['status']}" if nxt['status'] == "Operational" else f"⭐ {nxt['status']}")
+                else:
+                    st.markdown("_This is the last station on this highway._")
+
+            if station['status'] == "Upcoming":
+                st.warning("⚠️ This station is not yet operational — plan your charging stop around the previous/next active hub instead.")
+        else:
+            st.info("👆 Click any marker on the map above to see its next station in both directions.")
