@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import folium
 import re
+import requests
+from geopy.geocoders import Nominatim
 from streamlit_folium import st_folium
 from math import radians, cos, sin, asin, sqrt
 
@@ -35,6 +37,76 @@ st.markdown("""
     .stMetric div[data-testid="stMetricValue"] {
         color: #10B981 !important;
         font-weight: 700;
+    }
+    /* --- Highway Corridor View components --- */
+    .station-card {
+        background-color: #1E293B;
+        border: 1px solid #334155;
+        border-radius: 10px;
+        padding: 16px;
+        min-height: 168px;
+    }
+    .station-card.current {
+        border: 1px solid #10B981;
+        box-shadow: 0 0 0 1px rgba(16,185,129,0.35);
+    }
+    .station-card h5 {
+        margin: 0 0 8px 0;
+        color: #F8FAFC;
+        font-size: 14px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: #94A3B8;
+    }
+    .station-card .name { font-weight: 700; font-size: 15px; color: #F8FAFC; margin-bottom: 4px; }
+    .station-card .meta { font-size: 13px; color: #CBD5E1; line-height: 1.6; }
+    .badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.03em;
+    }
+    .badge-operational { background: rgba(16,185,129,0.15); color: #10B981; }
+    .badge-upcoming { background: rgba(245,158,11,0.15); color: #F59E0B; }
+    .badge-safe { background: rgba(16,185,129,0.15); color: #10B981; }
+    .badge-caution { background: rgba(245,158,11,0.15); color: #F59E0B; }
+    .badge-risk { background: rgba(239,68,68,0.18); color: #EF4444; }
+    /* Vertical route timeline */
+    .timeline-item {
+        display: flex;
+        gap: 12px;
+        position: relative;
+    }
+    .timeline-dot {
+        width: 30px; height: 30px; min-width: 30px;
+        border-radius: 50%;
+        display: flex; align-items: center; justify-content: center;
+        font-weight: 700; font-size: 12px; color: white;
+        border: 2px solid #0B0F19;
+        z-index: 1;
+    }
+    .timeline-line {
+        position: absolute;
+        left: 14px; top: 30px;
+        width: 2px;
+        background: #334155;
+    }
+    .timeline-content {
+        background-color: #1E293B;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 10px 14px;
+        flex: 1;
+        margin-bottom: 4px;
+    }
+    .timeline-content.selected { border-color: #10B981; box-shadow: 0 0 0 1px rgba(16,185,129,0.3); }
+    .timeline-gap {
+        font-size: 12px;
+        color: #94A3B8;
+        margin: 2px 0 2px 42px;
+        padding: 2px 0;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -184,6 +256,74 @@ def order_along_highway(hw_df):
     )
     return hw_df.sort_values('position_km').reset_index(drop=True)
 
+# --- City-to-City Route Planner: geocoding, real driving routes, and route-corridor matching ---
+@st.cache_data(show_spinner=False)
+def geocode_city(city_name):
+    """Turns a city name into (lat, lon, display_address) using OpenStreetMap Nominatim."""
+    geolocator = Nominatim(user_agent="voltran_ev_dashboard_app")
+    try:
+        location = geolocator.geocode(f"{city_name}, India", timeout=10)
+        if location:
+            return (location.latitude, location.longitude, location.address)
+    except Exception:
+        return None
+    return None
+
+@st.cache_data(show_spinner=False)
+def get_driving_route(start_lat, start_lon, end_lat, end_lon):
+    """Fetches the real driving route geometry between two points via the OSRM demo server."""
+    url = f"https://router.project-osrm.org/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}"
+    params = {"overview": "full", "geometries": "geojson"}
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        data = resp.json()
+        if data.get("code") == "Ok" and data.get("routes"):
+            route = data["routes"][0]
+            coords = [(c[1], c[0]) for c in route["geometry"]["coordinates"]]  # -> (lat, lon)
+            return {
+                "coords": coords,
+                "distance_km": route["distance"] / 1000.0,
+                "duration_min": route["duration"] / 60.0,
+            }
+    except Exception:
+        return None
+    return None
+
+def route_cumulative_distances(coords):
+    cum = [0.0]
+    for i in range(1, len(coords)):
+        cum.append(cum[-1] + haversine(coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1]))
+    return cum
+
+def nearest_point_on_route(lat, lon, coords, cum, sample_cap=800):
+    """Distance from (lat, lon) to the closest point on the route, and that point's
+    distance-from-start along the route. Samples the route to keep this fast on long routes."""
+    step = max(1, len(coords) // sample_cap)
+    best_d, best_i = float('inf'), 0
+    for i in range(0, len(coords), step):
+        d = haversine(lat, lon, coords[i][0], coords[i][1])
+        if d < best_d:
+            best_d, best_i = d, i
+    return best_d, cum[best_i]
+
+@st.cache_data(show_spinner=False)
+def stations_along_route(_coords_tuple, corridor_width_km):
+    """Finds every station within corridor_width_km of the route and orders them by
+    how far along the route they are. _coords_tuple must be a hashable tuple of (lat,lon)."""
+    coords = list(_coords_tuple)
+    cum = route_cumulative_distances(coords)
+    rows = []
+    for _, row in df.iterrows():
+        d, pos = nearest_point_on_route(row['lat'], row['lon'], coords, cum)
+        if d <= corridor_width_km:
+            r = row.to_dict()
+            r['position_km'] = pos
+            r['dist_from_route_km'] = d
+            rows.append(r)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values('position_km').reset_index(drop=True)
+
 # --- Provider Color Palette ---
 PROVIDER_COLORS = {
     "Voltran": "green",
@@ -195,6 +335,32 @@ PROVIDER_COLORS = {
     "GLIDA": "orange",
     "Ather Grid": "darkred"
 }
+
+# --- Hex equivalents of the folium color names above, for custom DivIcons ---
+PROVIDER_HEX = {
+    "Voltran": "#059669",
+    "Tata Power": "#2563EB",
+    "Statiq": "#065F46",
+    "Zeon Charging": "#5F9EA0",
+    "ChargeZone": "#7C3AED",
+    "Jio-bp pulse": "#DC2626",
+    "GLIDA": "#F97316",
+    "Ather Grid": "#991B1B",
+}
+UPCOMING_HEX = "#F59E0B"
+
+def numbered_icon(number, provider, is_upcoming, is_selected):
+    """A numbered circular marker so the map itself shows travel order,
+    with a highlighted ring for whichever station is currently selected."""
+    bg = UPCOMING_HEX if is_upcoming else PROVIDER_HEX.get(provider, "#64748B")
+    size = 34 if is_selected else 26
+    ring = "box-shadow: 0 0 0 3px #F8FAFC, 0 0 8px rgba(16,185,129,0.8);" if is_selected else "box-shadow: 0 2px 4px rgba(0,0,0,0.5);"
+    html = f"""<div style="
+        background:{bg}; color:white; border-radius:50%;
+        width:{size}px; height:{size}px; display:flex; align-items:center; justify-content:center;
+        font-weight:700; font-size:{13 if is_selected else 11}px; font-family:Arial, sans-serif;
+        border:2px solid #0B0F19; {ring}">{number}</div>"""
+    return folium.DivIcon(html=html, icon_size=(size, size), icon_anchor=(size // 2, size // 2))
 
 # --- Distance Calculation Matrix ---
 def compute_nearest_neighbors(dataset):
@@ -328,10 +494,11 @@ for _, row in filtered_df.iterrows():
 st_folium(m, width=1300, height=520)
 
 # --- Analysis Tabs ---
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "📏 Distance to Next Charging Station",
     "📋 Full Searchable Directory",
-    "🛣️ Highway Corridor View"
+    "🛣️ Highway Corridor View",
+    "📍 City-to-City Route Planner"
 ])
 
 with tab1:
@@ -348,11 +515,11 @@ with tab2:
     st.dataframe(filtered_df[['name', 'provider', 'state', 'status', 'corridor', 'kw', 'address', 'lat', 'lon']], use_container_width=True)
 
 with tab3:
-    st.subheader("🛣️ Plan Your Route on a Single National Highway")
+    st.subheader("🛣️ Highway Corridor Planner")
     st.markdown(
-        "Pick a highway to see every charging station along it, in order. "
-        "Click a marker to see the next station in **both directions**, how far it is, "
-        "and everything you need for the leg ahead."
+        "Pick a national highway to see every charging station along it, in travel order — "
+        "then select any stop (click the map or use the dropdown) to see what's before and after it, "
+        "how far, and whether the gap is safe for your EV's range."
     )
 
     available_highways = sorted(df['highway'].dropna().unique())
@@ -360,91 +527,469 @@ with tab3:
     if not available_highways:
         st.info("No stations in the current dataset are tagged to a numbered national highway.")
     else:
-        selected_highway = st.selectbox("Choose a National Highway:", options=available_highways)
+        ctrl1, ctrl2, ctrl3 = st.columns([2, 1.4, 1.4])
+        with ctrl1:
+            selected_highway = st.selectbox("🛣️ Choose a National Highway:", options=available_highways)
+        with ctrl2:
+            operational_only = st.checkbox("Only show operational stations", value=False,
+                                            help="Hide 'Upcoming' hubs that aren't chargeable yet — recommended for real trip planning.")
+        with ctrl3:
+            ev_range_km = st.number_input("🔋 Your EV's range (km)", min_value=50, max_value=800, value=300, step=10)
 
+        # --- Build the ordered station set for this highway ---
         hw_df = df[df['highway'] == selected_highway]
+        if operational_only:
+            hw_df = hw_df[hw_df['status'] == "Operational"]
         hw_df = order_along_highway(hw_df)
         total_on_highway = len(hw_df)
 
-        st.markdown(
-            f"**{selected_highway}** has **{total_on_highway} charging station(s)** in this dataset, "
-            f"spanning roughly **{hw_df['position_km'].max():.0f} km** end to end."
-        )
+        if total_on_highway == 0:
+            st.warning("No operational stations on this highway yet. Uncheck the filter to see upcoming hubs.")
+        else:
+            station_names_in_order = hw_df['name'].tolist()
 
-        # --- Highway Map: markers in travel order, connected by a route line ---
-        hw_center_lat = hw_df['lat'].mean()
-        hw_center_lon = hw_df['lon'].mean()
-        hm = folium.Map(location=[hw_center_lat, hw_center_lon], zoom_start=7, tiles="CartoDB dark_matter")
+            # A safe usable range: leave a buffer rather than planning to arrive on empty
+            safe_range_km = ev_range_km * 0.65
 
-        route_points = list(zip(hw_df['lat'], hw_df['lon']))
-        folium.PolyLine(route_points, color="#10B981", weight=3, opacity=0.6, dash_array="6").add_to(hm)
+            gaps = hw_df['position_km'].diff().fillna(0)
+            max_gap = gaps.max() if total_on_highway > 1 else 0
+            avg_gap = gaps[1:].mean() if total_on_highway > 1 else 0
+            stops_needed = max(0, int(np.ceil(hw_df['position_km'].max() / safe_range_km))) if total_on_highway > 1 else 0
+            risky_gap_count = int((gaps > safe_range_km).sum())
 
-        for idx, row in hw_df.iterrows():
-            is_upcoming = row['status'] == "Upcoming"
-            icon_type = folium.Icon(
-                color="orange" if is_upcoming else PROVIDER_COLORS.get(row['provider'], 'gray'),
-                icon="star" if is_upcoming else "bolt",
-                prefix="fa"
-            )
-            folium.Marker(
-                location=[row['lat'], row['lon']],
-                tooltip=row['name'],
-                popup=f"Stop {idx + 1} of {total_on_highway} on {selected_highway}",
-                icon=icon_type
-            ).add_to(hm)
+            # --- Summary stat row ---
+            s1, s2, s3, s4, s5 = st.columns(5)
+            s1.metric("Stations on Route", total_on_highway)
+            s2.metric("Highway Span", f"{hw_df['position_km'].max():.0f} km")
+            s3.metric("Avg. Gap Between Stops", f"{avg_gap:.0f} km" if total_on_highway > 1 else "—")
+            s4.metric("Longest Gap", f"{max_gap:.0f} km" if total_on_highway > 1 else "—")
+            s5.metric("Est. Charging Stops Needed", stops_needed if total_on_highway > 1 else "—",
+                      help=f"Based on a safe usable range of {safe_range_km:.0f} km (65% of your entered range).")
 
-        hw_map_data = st_folium(hm, width=1300, height=520, key=f"highway_map_{selected_highway}")
+            if risky_gap_count > 0:
+                st.error(f"⚠️ **Range Anxiety Alert:** {risky_gap_count} gap(s) on this highway exceed your safe range "
+                          f"of {safe_range_km:.0f} km. Check the flagged segments in the route timeline below before you go.")
+            else:
+                st.success(f"✅ Every gap on this highway is within your safe range of {safe_range_km:.0f} km.")
 
-        # --- Detail panel for the clicked station ---
-        clicked_name = None
-        if hw_map_data and hw_map_data.get("last_object_clicked_tooltip"):
-            clicked_name = hw_map_data["last_object_clicked_tooltip"]
+            # --- Selection state: keep the currently focused station in sync across reruns ---
+            if ("selected_station" not in st.session_state
+                    or st.session_state.selected_station not in station_names_in_order):
+                st.session_state.selected_station = station_names_in_order[0]
 
-        if clicked_name and clicked_name in hw_df['name'].values:
-            pos = hw_df.index[hw_df['name'] == clicked_name][0]
-            station = hw_df.loc[pos]
+            # --- Map: numbered markers in travel order, current selection highlighted ---
+            map_col, list_col = st.columns([1.6, 1])
+
+            with map_col:
+                hw_df_bounds = hw_df[['lat', 'lon']].values.tolist()
+                hm = folium.Map(tiles="CartoDB dark_matter")
+                hm.fit_bounds(hw_df_bounds, padding=(30, 30))
+
+                route_points = list(zip(hw_df['lat'], hw_df['lon']))
+                folium.PolyLine(route_points, color="#10B981", weight=3, opacity=0.6, dash_array="6").add_to(hm)
+
+                for idx, row in hw_df.iterrows():
+                    is_upcoming = row['status'] == "Upcoming"
+                    is_selected = row['name'] == st.session_state.selected_station
+                    popup_html = (
+                        f"<b>{idx + 1}. {row['name']}</b><br>"
+                        f"{row['provider']} · {row['kw']}<br>"
+                        f"{'⭐ Upcoming' if is_upcoming else '🟢 Operational'}"
+                    )
+                    folium.Marker(
+                        location=[row['lat'], row['lon']],
+                        tooltip=row['name'],
+                        popup=folium.Popup(popup_html, max_width=220),
+                        icon=numbered_icon(idx + 1, row['provider'], is_upcoming, is_selected)
+                    ).add_to(hm)
+
+                hw_map_data = st_folium(hm, width=None, height=480, key=f"highway_map_{selected_highway}_{operational_only}")
+
+                clicked_name = None
+                if hw_map_data and hw_map_data.get("last_object_clicked_tooltip"):
+                    clicked_name = hw_map_data["last_object_clicked_tooltip"]
+                if clicked_name and clicked_name in station_names_in_order:
+                    st.session_state.selected_station = clicked_name
+
+            with list_col:
+                st.markdown("**Jump to a stop:**")
+                dropdown_options = [f"{i+1}. {n}" for i, n in enumerate(station_names_in_order)]
+                current_idx = station_names_in_order.index(st.session_state.selected_station)
+                picked = st.selectbox(
+                    "Jump to a stop", options=dropdown_options, index=current_idx,
+                    label_visibility="collapsed", key=f"dropdown_{selected_highway}_{operational_only}"
+                )
+                picked_name = picked.split(". ", 1)[1]
+                if picked_name != st.session_state.selected_station:
+                    st.session_state.selected_station = picked_name
+
+                # --- Full ordered route timeline for this highway ---
+                st.markdown("**Full route, in order:**")
+                timeline_html = "<div>"
+                for i, row in hw_df.iterrows():
+                    is_upcoming = row['status'] == "Upcoming"
+                    is_sel = row['name'] == st.session_state.selected_station
+                    dot_bg = UPCOMING_HEX if is_upcoming else PROVIDER_HEX.get(row['provider'], "#64748B")
+                    badge = '<span class="badge badge-upcoming">UPCOMING</span>' if is_upcoming else '<span class="badge badge-operational">LIVE</span>'
+                    timeline_html += f"""
+                    <div class="timeline-item">
+                        <div class="timeline-dot" style="background:{dot_bg};">{i+1}</div>
+                        <div class="timeline-content {'selected' if is_sel else ''}">
+                            <div style="font-weight:600; font-size:13px;">{row['name']}</div>
+                            <div style="font-size:11px; color:#94A3B8;">{row['provider']} · {row['kw']} &nbsp; {badge}</div>
+                        </div>
+                    </div>"""
+                    if i < total_on_highway - 1:
+                        gap = gaps.iloc[i + 1]
+                        if gap > safe_range_km:
+                            risk_badge = '<span class="badge badge-risk">⚠ EXCEEDS RANGE</span>'
+                        elif gap > safe_range_km * 0.7:
+                            risk_badge = '<span class="badge badge-caution">CAUTION</span>'
+                        else:
+                            risk_badge = '<span class="badge badge-safe">SAFE</span>'
+                        timeline_html += f'<div class="timeline-gap">↓ {gap:.0f} km &nbsp; {risk_badge}</div>'
+                timeline_html += "</div>"
+                st.markdown(
+                    f'<div style="max-height:420px; overflow-y:auto; padding-right:6px;">{timeline_html}</div>',
+                    unsafe_allow_html=True
+                )
+
+            # --- Detail panel: previous / current / next, with "next operational" fallback ---
+            pos = station_names_in_order.index(st.session_state.selected_station)
+            station = hw_df.iloc[pos]
 
             st.markdown("---")
-            st.markdown(f"### 📍 {station['name']}  &nbsp; <span style='font-size:14px; color:#94A3B8;'>(Stop {pos + 1} of {total_on_highway} on {selected_highway})</span>", unsafe_allow_html=True)
+            st.markdown(
+                f"### 📍 {station['name']} &nbsp; "
+                f"<span style='font-size:14px; color:#94A3B8;'>(Stop {pos + 1} of {total_on_highway} on {selected_highway})</span>",
+                unsafe_allow_html=True
+            )
+
+            def render_neighbor(col, row, label, arrow, dist):
+                status_badge = '<span class="badge badge-operational">OPERATIONAL</span>' if row['status'] == "Operational" else '<span class="badge badge-upcoming">UPCOMING</span>'
+                col.markdown(f"""
+                <div class="station-card">
+                    <h5>{arrow} {label}</h5>
+                    <div class="name">{row['name']}</div>
+                    <div class="meta">
+                        📏 {dist:.1f} km away<br>
+                        ⚡ {row['kw']}<br>
+                        🏢 {row['provider']}<br>
+                        {status_badge}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
             c1, c2, c3 = st.columns(3)
 
-            # Previous station (toward the anchor / one direction)
             with c1:
-                st.markdown("**⬅️ Previous Station**")
                 if pos > 0:
-                    prev = hw_df.loc[pos - 1]
-                    dist = station['position_km'] - prev['position_km']
-                    st.markdown(f"**{prev['name']}**")
-                    st.markdown(f"📏 {dist:.1f} km away")
-                    st.markdown(f"⚡ {prev['kw']} · {prev['provider']}")
-                    st.markdown(f"🟢 {prev['status']}" if prev['status'] == "Operational" else f"⭐ {prev['status']}")
+                    prev = hw_df.iloc[pos - 1]
+                    render_neighbor(c1, prev, "Previous Station", "⬅️", station['position_km'] - prev['position_km'])
+                    if prev['status'] == "Upcoming":
+                        prior_ops = hw_df.iloc[:pos][hw_df.iloc[:pos]['status'] == "Operational"]
+                        if not prior_ops.empty:
+                            nearest_op = prior_ops.iloc[-1]
+                            c1.caption(f"⚡ Next *operational* stop back: **{nearest_op['name']}** "
+                                       f"({station['position_km'] - nearest_op['position_km']:.1f} km)")
                 else:
-                    st.markdown("_This is the first station on this highway._")
+                    c1.markdown('<div class="station-card"><h5>⬅️ Previous Station</h5><div class="meta">This is the first station on this highway.</div></div>', unsafe_allow_html=True)
 
-            # Current station details
             with c2:
-                st.markdown("**🔌 This Station**")
-                st.markdown(f"**Provider:** {station['provider']}")
-                st.markdown(f"**Status:** {'🟢 Operational' if station['status'] == 'Operational' else '⭐ Upcoming'}")
-                st.markdown(f"**Charging Speed:** {station['kw']}")
-                st.markdown(f"**State:** {station['state']}")
-                st.markdown(f"**Address:** {station['address']}")
+                status_badge = '<span class="badge badge-operational">OPERATIONAL</span>' if station['status'] == "Operational" else '<span class="badge badge-upcoming">UPCOMING</span>'
+                c2.markdown(f"""
+                <div class="station-card current">
+                    <h5>🔌 This Station</h5>
+                    <div class="name">{station['name']}</div>
+                    <div class="meta">
+                        🏢 {station['provider']} &nbsp; {status_badge}<br>
+                        ⚡ {station['kw']}<br>
+                        📍 {station['state']}<br>
+                        🏠 {station['address']}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
-            # Next station (the other direction)
             with c3:
-                st.markdown("**➡️ Next Station**")
                 if pos < total_on_highway - 1:
-                    nxt = hw_df.loc[pos + 1]
-                    dist = nxt['position_km'] - station['position_km']
-                    st.markdown(f"**{nxt['name']}**")
-                    st.markdown(f"📏 {dist:.1f} km away")
-                    st.markdown(f"⚡ {nxt['kw']} · {nxt['provider']}")
-                    st.markdown(f"🟢 {nxt['status']}" if nxt['status'] == "Operational" else f"⭐ {nxt['status']}")
+                    nxt = hw_df.iloc[pos + 1]
+                    render_neighbor(c3, nxt, "Next Station", "➡️", nxt['position_km'] - station['position_km'])
+                    if nxt['status'] == "Upcoming":
+                        later_ops = hw_df.iloc[pos + 1:][hw_df.iloc[pos + 1:]['status'] == "Operational"]
+                        if not later_ops.empty:
+                            nearest_op = later_ops.iloc[0]
+                            c3.caption(f"⚡ Next *operational* stop ahead: **{nearest_op['name']}** "
+                                       f"({nearest_op['position_km'] - station['position_km']:.1f} km)")
                 else:
-                    st.markdown("_This is the last station on this highway._")
+                    c3.markdown('<div class="station-card"><h5>➡️ Next Station</h5><div class="meta">This is the last station on this highway.</div></div>', unsafe_allow_html=True)
 
             if station['status'] == "Upcoming":
-                st.warning("⚠️ This station is not yet operational — plan your charging stop around the previous/next active hub instead.")
+                st.warning("⚠️ This station is not yet operational — plan your charging stop around the previous/next live hub instead.")
+
+            # --- Export the route ---
+            export_df = hw_df[['name', 'provider', 'status', 'kw', 'state', 'address', 'position_km']].copy()
+            export_df.insert(0, 'stop_number', range(1, total_on_highway + 1))
+            export_df = export_df.rename(columns={'position_km': 'distance_from_start_km'})
+            st.download_button(
+                "⬇️ Download this route as CSV",
+                data=export_df.to_csv(index=False).encode('utf-8'),
+                file_name=f"{selected_highway}_charging_route.csv",
+                mime="text/csv"
+            )
+
+with tab4:
+    st.subheader("📍 Plan a Route Between Two Cities")
+    st.markdown(
+        "Enter where you're starting and where you're headed — we'll pull the real driving route "
+        "and show every charging station within reach of it, in the order you'll pass them."
+    )
+
+    rc1, rc2, rc3 = st.columns([2, 2, 1])
+    with rc1:
+        start_city = st.text_input("From", placeholder="e.g. Hyderabad", key="route_start_input")
+    with rc2:
+        end_city = st.text_input("To", placeholder="e.g. Tirupati", key="route_end_input")
+    with rc3:
+        st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+        find_route_clicked = st.button("🔍 Find Route", use_container_width=True)
+
+    rc4, rc5 = st.columns(2)
+    with rc4:
+        route_ev_range_km = st.number_input("🔋 Your EV's range (km)", min_value=50, max_value=800, value=300, step=10, key="route_ev_range")
+    with rc5:
+        corridor_width_km = st.slider(
+            "Search width around the route (km)", min_value=5, max_value=50, value=20,
+            help="Stations within this distance of the actual driving path count as 'on the way'."
+        )
+
+    if find_route_clicked:
+        if not start_city.strip() or not end_city.strip():
+            st.warning("Enter both a starting city and a destination.")
         else:
-            st.info("👆 Click any marker on the map above to see its next station in both directions.")
+            with st.spinner(f"Locating {start_city} and {end_city}..."):
+                start_geo = geocode_city(start_city.strip())
+                end_geo = geocode_city(end_city.strip())
+
+            if not start_geo:
+                st.error(f"Couldn't find '{start_city}'. Try adding the state, e.g. 'Warangal, Telangana'.")
+            elif not end_geo:
+                st.error(f"Couldn't find '{end_city}'. Try adding the state, e.g. 'Kadapa, Andhra Pradesh'.")
+            else:
+                with st.spinner("Calculating the driving route..."):
+                    route = get_driving_route(start_geo[0], start_geo[1], end_geo[0], end_geo[1])
+
+                if not route:
+                    st.error("Couldn't calculate a driving route between these two places right now — the routing "
+                              "service may be temporarily unavailable, or they aren't connected by road. Try again in a moment.")
+                else:
+                    st.session_state.route_data = route
+                    st.session_state.route_start_geo = start_geo
+                    st.session_state.route_end_geo = end_geo
+                    st.session_state.route_start_name = start_city.strip()
+                    st.session_state.route_end_name = end_city.strip()
+                    st.session_state.route_selected_station = None
+
+    if st.session_state.get("route_data"):
+        route = st.session_state.route_data
+        coords_tuple = tuple(route["coords"])
+
+        route_df = stations_along_route(coords_tuple, corridor_width_km)
+        total_route_stations = len(route_df)
+
+        st.markdown(
+            f"**{st.session_state.route_start_name} → {st.session_state.route_end_name}**: "
+            f"{route['distance_km']:.0f} km, roughly {route['duration_min']/60:.1f} hr driving. "
+            f"**{total_route_stations} charging station(s)** found within {corridor_width_km} km of the route."
+        )
+
+        if total_route_stations == 0:
+            st.warning("No stations found within this search width. Try widening the 'Search width around the route' slider above.")
+        else:
+            safe_range_km = route_ev_range_km * 0.65
+            gaps = route_df['position_km'].diff().fillna(0)
+            max_gap = gaps.max() if total_route_stations > 1 else 0
+            avg_gap = gaps[1:].mean() if total_route_stations > 1 else 0
+            stops_needed = max(0, int(np.ceil(route_df['position_km'].max() / safe_range_km))) if total_route_stations > 1 else 0
+            risky_gap_count = int((gaps > safe_range_km).sum())
+
+            s1, s2, s3, s4, s5 = st.columns(5)
+            s1.metric("Stations Along Route", total_route_stations)
+            s2.metric("Total Route Distance", f"{route['distance_km']:.0f} km")
+            s3.metric("Avg. Gap Between Stops", f"{avg_gap:.0f} km" if total_route_stations > 1 else "—")
+            s4.metric("Longest Gap", f"{max_gap:.0f} km" if total_route_stations > 1 else "—")
+            s5.metric("Est. Charging Stops Needed", stops_needed if total_route_stations > 1 else "—",
+                      help=f"Based on a safe usable range of {safe_range_km:.0f} km (65% of your entered range).")
+
+            if risky_gap_count > 0:
+                st.error(f"⚠️ **Range Anxiety Alert:** {risky_gap_count} gap(s) on this route exceed your safe range "
+                          f"of {safe_range_km:.0f} km. Check the flagged segments in the route timeline below.")
+            else:
+                st.success(f"✅ Every gap on this route is within your safe range of {safe_range_km:.0f} km.")
+
+            station_names_in_order = route_df['name'].tolist()
+            if ("route_selected_station" not in st.session_state
+                    or st.session_state.route_selected_station not in station_names_in_order):
+                st.session_state.route_selected_station = station_names_in_order[0]
+
+            map_col, list_col = st.columns([1.6, 1])
+
+            with map_col:
+                rm = folium.Map(tiles="CartoDB dark_matter")
+                all_pts = route["coords"]
+                rm.fit_bounds(all_pts, padding=(30, 30))
+
+                # The actual driving route, in full
+                folium.PolyLine(all_pts, color="#3B82F6", weight=4, opacity=0.65).add_to(rm)
+
+                folium.Marker(
+                    location=[st.session_state.route_start_geo[0], st.session_state.route_start_geo[1]],
+                    tooltip=f"Start: {st.session_state.route_start_name}",
+                    icon=folium.Icon(color="lightgray", icon="play", prefix="fa")
+                ).add_to(rm)
+                folium.Marker(
+                    location=[st.session_state.route_end_geo[0], st.session_state.route_end_geo[1]],
+                    tooltip=f"Destination: {st.session_state.route_end_name}",
+                    icon=folium.Icon(color="lightgray", icon="flag-checkered", prefix="fa")
+                ).add_to(rm)
+
+                for idx, row in route_df.iterrows():
+                    is_upcoming = row['status'] == "Upcoming"
+                    is_selected = row['name'] == st.session_state.route_selected_station
+                    popup_html = (
+                        f"<b>{idx + 1}. {row['name']}</b><br>"
+                        f"{row['provider']} · {row['kw']}<br>"
+                        f"{row['dist_from_route_km']:.1f} km off the route<br>"
+                        f"{'⭐ Upcoming' if is_upcoming else '🟢 Operational'}"
+                    )
+                    marker = folium.Marker(
+                        location=[row['lat'], row['lon']],
+                        tooltip=row['name'],
+                        popup=folium.Popup(popup_html, max_width=220),
+                        icon=numbered_icon(idx + 1, row['provider'], is_upcoming, is_selected)
+                    )
+                    marker.add_to(rm)
+
+                route_map_data = st_folium(rm, width=None, height=480,
+                                            key=f"route_map_{st.session_state.route_start_name}_{st.session_state.route_end_name}_{corridor_width_km}")
+
+                clicked_name = None
+                if route_map_data and route_map_data.get("last_object_clicked_tooltip"):
+                    clicked_name = route_map_data["last_object_clicked_tooltip"]
+                if clicked_name and clicked_name in station_names_in_order:
+                    st.session_state.route_selected_station = clicked_name
+
+            with list_col:
+                st.markdown("**Jump to a stop:**")
+                dropdown_options = [f"{i+1}. {n}" for i, n in enumerate(station_names_in_order)]
+                current_idx = station_names_in_order.index(st.session_state.route_selected_station)
+                picked = st.selectbox(
+                    "Jump to a stop", options=dropdown_options, index=current_idx,
+                    label_visibility="collapsed",
+                    key=f"route_dropdown_{st.session_state.route_start_name}_{st.session_state.route_end_name}_{corridor_width_km}"
+                )
+                picked_name = picked.split(". ", 1)[1]
+                if picked_name != st.session_state.route_selected_station:
+                    st.session_state.route_selected_station = picked_name
+
+                st.markdown("**Full route, in order:**")
+                timeline_html = "<div>"
+                for i, row in route_df.iterrows():
+                    is_upcoming = row['status'] == "Upcoming"
+                    is_sel = row['name'] == st.session_state.route_selected_station
+                    dot_bg = UPCOMING_HEX if is_upcoming else PROVIDER_HEX.get(row['provider'], "#64748B")
+                    badge = '<span class="badge badge-upcoming">UPCOMING</span>' if is_upcoming else '<span class="badge badge-operational">LIVE</span>'
+                    timeline_html += f"""
+                    <div class="timeline-item">
+                        <div class="timeline-dot" style="background:{dot_bg};">{i+1}</div>
+                        <div class="timeline-content {'selected' if is_sel else ''}">
+                            <div style="font-weight:600; font-size:13px;">{row['name']}</div>
+                            <div style="font-size:11px; color:#94A3B8;">{row['provider']} · {row['kw']} &nbsp; {badge} &nbsp; {row['dist_from_route_km']:.1f} km off route</div>
+                        </div>
+                    </div>"""
+                    if i < total_route_stations - 1:
+                        gap = gaps.iloc[i + 1]
+                        if gap > safe_range_km:
+                            risk_badge = '<span class="badge badge-risk">⚠ EXCEEDS RANGE</span>'
+                        elif gap > safe_range_km * 0.7:
+                            risk_badge = '<span class="badge badge-caution">CAUTION</span>'
+                        else:
+                            risk_badge = '<span class="badge badge-safe">SAFE</span>'
+                        timeline_html += f'<div class="timeline-gap">↓ {gap:.0f} km &nbsp; {risk_badge}</div>'
+                timeline_html += "</div>"
+                st.markdown(
+                    f'<div style="max-height:420px; overflow-y:auto; padding-right:6px;">{timeline_html}</div>',
+                    unsafe_allow_html=True
+                )
+
+            pos = station_names_in_order.index(st.session_state.route_selected_station)
+            station = route_df.iloc[pos]
+
+            st.markdown("---")
+            st.markdown(
+                f"### 📍 {station['name']} &nbsp; "
+                f"<span style='font-size:14px; color:#94A3B8;'>(Stop {pos + 1} of {total_route_stations} "
+                f"between {st.session_state.route_start_name} and {st.session_state.route_end_name})</span>",
+                unsafe_allow_html=True
+            )
+
+            def render_route_neighbor(col, row, label, arrow, dist):
+                status_badge = '<span class="badge badge-operational">OPERATIONAL</span>' if row['status'] == "Operational" else '<span class="badge badge-upcoming">UPCOMING</span>'
+                col.markdown(f"""
+                <div class="station-card">
+                    <h5>{arrow} {label}</h5>
+                    <div class="name">{row['name']}</div>
+                    <div class="meta">
+                        📏 {dist:.1f} km away<br>
+                        ⚡ {row['kw']}<br>
+                        🏢 {row['provider']}<br>
+                        {status_badge}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            c1, c2, c3 = st.columns(3)
+
+            with c1:
+                if pos > 0:
+                    prev = route_df.iloc[pos - 1]
+                    render_route_neighbor(c1, prev, "Previous Station", "⬅️", station['position_km'] - prev['position_km'])
+                else:
+                    c1.markdown(f'<div class="station-card"><h5>⬅️ Previous Station</h5><div class="meta">This is the first stop after {st.session_state.route_start_name}.</div></div>', unsafe_allow_html=True)
+
+            with c2:
+                status_badge = '<span class="badge badge-operational">OPERATIONAL</span>' if station['status'] == "Operational" else '<span class="badge badge-upcoming">UPCOMING</span>'
+                c2.markdown(f"""
+                <div class="station-card current">
+                    <h5>🔌 This Station</h5>
+                    <div class="name">{station['name']}</div>
+                    <div class="meta">
+                        🏢 {station['provider']} &nbsp; {status_badge}<br>
+                        ⚡ {station['kw']}<br>
+                        📍 {station['state']} &nbsp;·&nbsp; {station['dist_from_route_km']:.1f} km off the route<br>
+                        🏠 {station['address']}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with c3:
+                if pos < total_route_stations - 1:
+                    nxt = route_df.iloc[pos + 1]
+                    render_route_neighbor(c3, nxt, "Next Station", "➡️", nxt['position_km'] - station['position_km'])
+                else:
+                    c3.markdown(f'<div class="station-card"><h5>➡️ Next Station</h5><div class="meta">This is the last stop before {st.session_state.route_end_name}.</div></div>', unsafe_allow_html=True)
+
+            if station['status'] == "Upcoming":
+                st.warning("⚠️ This station is not yet operational — plan your charging stop around the previous/next live hub instead.")
+
+            export_df = route_df[['name', 'provider', 'status', 'kw', 'state', 'address', 'position_km', 'dist_from_route_km']].copy()
+            export_df.insert(0, 'stop_number', range(1, total_route_stations + 1))
+            export_df = export_df.rename(columns={'position_km': 'distance_from_start_km', 'dist_from_route_km': 'distance_off_route_km'})
+            st.download_button(
+                "⬇️ Download this route as CSV",
+                data=export_df.to_csv(index=False).encode('utf-8'),
+                file_name=f"{st.session_state.route_start_name}_to_{st.session_state.route_end_name}_charging_route.csv",
+                mime="text/csv",
+                key="route_dl_btn"
+            )
+    else:
+        st.info("👆 Enter a starting city and destination, then click **Find Route** to see the plan.")
